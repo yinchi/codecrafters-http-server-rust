@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::io::{Read, Write, BufReader, BufRead};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
 use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
+use std::vec;
 
 fn main() -> std::io::Result<()> {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -112,7 +113,26 @@ fn handle_request(request: &Request) -> (u16, String) {
     // Return HTTP 200 on the root path, and 404 on any other path
     // println!("Received request: {:?}", request);
     match request.path.as_str() {
-        "/" => (200, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string()),
-        _ => (404, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()),
+        "/" => (
+            200,
+            ["HTTP/1.1 200 OK", "Content-Length: 0", "", ""].join("\r\n"),
+        ),
+        s if s.starts_with("/echo/") => {
+            let sub_path = &s[6..];
+            (
+                200,
+                [
+                    "HTTP/1.1 200 OK",
+                    &format!("Content-Length: {}", sub_path.len()),
+                    "",
+                    sub_path,
+                ]
+                .join("\r\n"),
+            )
+        }
+        _ => (
+            404,
+            ["HTTP/1.1 404 Not Found", "Content-Length: 0", "", ""].join("\r\n"),
+        ),
     }
 }
