@@ -123,6 +123,7 @@ fn handle_request(request: &Request) -> (u16, String) {
                 200,
                 [
                     "HTTP/1.1 200 OK",
+                    "Content-Type: text/plain",
                     &format!("Content-Length: {}", sub_path.len()),
                     "",
                     sub_path,
