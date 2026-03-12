@@ -113,27 +113,61 @@ fn handle_request(request: &Request) -> (u16, String) {
     // Return HTTP 200 on the root path, and 404 on any other path
     // println!("Received request: {:?}", request);
     match request.path.as_str() {
-        "/" => (
-            200,
-            ["HTTP/1.1 200 OK", "Content-Length: 0", "", ""].join("\r\n"),
-        ),
-        s if s.starts_with("/echo/") => {
-            let sub_path = &s[6..];
-            (
-                200,
-                [
-                    "HTTP/1.1 200 OK",
-                    "Content-Type: text/plain",
-                    &format!("Content-Length: {}", sub_path.len()),
-                    "",
-                    sub_path,
-                ]
-                .join("\r\n"),
-            )
-        }
-        _ => (
-            404,
-            ["HTTP/1.1 404 Not Found", "Content-Length: 0", "", ""].join("\r\n"),
-        ),
+        "/" => handle_root(),
+        s if s.starts_with("/echo/") => handle_echo(request),
+        s if s.starts_with("/user-agent") => handle_user_agent(request),
+        _ => handle_404(),
     }
+}
+
+fn handle_root() -> (u16, String) {
+    (
+        200,
+        ["HTTP/1.1 200 OK", "Content-Length: 0", "", ""].join("\r\n"),
+    )
+}
+
+fn handle_echo(request: &Request) -> (u16, String) {
+    let path = request.path.strip_prefix("/echo/").unwrap_or("");
+    (
+        200,
+        [
+            "HTTP/1.1 200 OK",
+            "Content-Type: text/plain",
+            &format!("Content-Length: {}", path.len()),
+            "",
+            path,
+        ]
+        .join("\r\n"),
+    )
+}
+
+fn handle_user_agent(request: &Request) -> (u16, String) {
+    let user_agent = get_header_else(request, "User-Agent", "Unknown");
+    (
+        200,
+        [
+            "HTTP/1.1 200 OK",
+            "Content-Type: text/plain",
+            &format!("Content-Length: {}", user_agent.len()),
+            "",
+            &user_agent,
+        ]
+        .join("\r\n"),
+    )
+}
+
+fn handle_404() -> (u16, String) {
+    (
+        404,
+        ["HTTP/1.1 404 Not Found", "Content-Length: 0", "", ""].join("\r\n"),
+    )
+}
+
+fn get_header(request: &Request, header_name: &str) -> Option<String> {
+    request.headers.get(header_name).cloned()
+}
+
+fn get_header_else(request: &Request, header_name: &str, default: &str) -> String {
+    get_header(request, header_name).unwrap_or_else(|| default.to_string())
 }
