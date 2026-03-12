@@ -87,28 +87,63 @@ fn handle_client(
     stream: &mut std::net::TcpStream,
     server_config: ServerConfig,
 ) -> std::io::Result<()> {
-    let request = Request::from_stream(stream)?;
-    let (status, response) = handle_request(&request, &server_config);
-    println!(
-        "{:<21} {:<3} {:<7} {}",
-        stream.peer_addr()?,
-        status,
-        request.method,
-        request.path,
-    );
-    stream.write_all(&response)?;
+    // Short timeout for testing
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    loop {
+        let request = match Request::from_stream(&mut reader) {
+            Ok(r) => r,
+            Err(e) if e.kind() == IoErrorKind::ConnectionAborted => break,
+            Err(e) if matches!(e.kind(), IoErrorKind::TimedOut | IoErrorKind::WouldBlock) => {
+                eprintln!("Timeout reading request from {}: {}", stream.peer_addr()?, e);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                break;
+            }
+            Err(e) if matches!(e.kind(), IoErrorKind::ConnectionReset | IoErrorKind::BrokenPipe) => {
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error reading request from {}: {}", stream.peer_addr()?, e);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                break;
+            }
+        };
+        let connection_close = request
+            .headers
+            .get("Connection")
+            .is_some_and(|v| v.eq_ignore_ascii_case("close"));
+        let (status, response) = handle_request(&request, &server_config);
+        println!(
+            "{:<21} {:<3} {:<7} {}",
+            stream.peer_addr()?,
+            status,
+            request.method,
+            request.path,
+        );
+        if let Err(e) = stream.write_all(&response) {
+            eprintln!("Error writing response to {}: {}", stream.peer_addr()?, e);
+            break;
+        }
+        if connection_close {
+            break;
+        }
+    }
     Ok(())
 }
 
 impl Request {
-    fn from_stream(stream: &mut std::net::TcpStream) -> std::io::Result<Self> {
-        let mut reader = BufReader::new(stream);
-
+    fn from_stream(reader: &mut BufReader<std::net::TcpStream>) -> std::io::Result<Self> {
         // Parse the request line
         // The request line should be in the format: METHOD PATH VERSION
         let mut line_buf = String::new();
 
-        reader.read_line(&mut line_buf)?;
+        if reader.read_line(&mut line_buf)? == 0 {
+            return Err(IoError::new(IoErrorKind::ConnectionAborted, "Connection closed"));
+        }
 
         let mut parts = line_buf.split_whitespace();
         let method = parts.next().ok_or(IoError::new(
@@ -166,6 +201,8 @@ impl Request {
                 IoError::new(IoErrorKind::InvalidData, "Invalid Content-Length value")
             })?;
             let mut body_buf = vec![0; content_length];
+
+            // Raises UnexpectedEof if the client closes the connection before sending the full body
             reader.read_exact(&mut body_buf)?;
             body = Some(String::from_utf8_lossy(&body_buf).to_string());
         }
