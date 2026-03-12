@@ -116,7 +116,7 @@ fn handle_client(
             .headers
             .get("Connection")
             .is_some_and(|v| v.eq_ignore_ascii_case("close"));
-        let (status, response) = handle_request(&request, &server_config);
+        let (status, response) = handle_request(&request, &server_config, connection_close);
         println!(
             "{:<21} {:<3} {:<7} {}",
             stream.peer_addr()?,
@@ -217,44 +217,43 @@ impl Request {
     }
 }
 
-fn handle_request(request: &Request, server_config: &ServerConfig) -> (u16, Vec<u8>) {
+fn handle_request(request: &Request, server_config: &ServerConfig, connection_close: bool) -> (u16, Vec<u8>) {
     // Return HTTP 200 on the root path, and 404 on any other path
     // println!("Received request: {:?}", request);
     match request.path.as_str() {
-        "/" => handle_root(),
+        "/" => handle_root(connection_close),
         s if s.starts_with("/echo/") => match request.method.as_str() {
-            "GET" => handle_echo(request),
-            _ => handle_404(), // Only support GET for /echo/
+            "GET" => handle_echo(request, connection_close),
+            _ => handle_404(connection_close), // Only support GET for /echo/
         },
         s if s.starts_with("/user-agent") => match request.method.as_str() {
-            "GET" => handle_user_agent(request),
-            _ => handle_404(), // Only support GET for /user-agent
+            "GET" => handle_user_agent(request, connection_close),
+            _ => handle_404(connection_close), // Only support GET for /user-agent
         },
         s if s.starts_with("/files/") => match request.method.as_str() {
-            "GET" => handle_file_get(request, server_config),
-            "POST" => handle_file_post(request, server_config),
-            _ => handle_404(), // Unsupported method for /files/
+            "GET" => handle_file_get(request, server_config, connection_close),
+            "POST" => handle_file_post(request, server_config, connection_close),
+            _ => handle_404(connection_close), // Unsupported method for /files/
         },
-        _ => handle_404(),
+        _ => handle_404(connection_close),
     }
 }
 
-fn handle_root() -> (u16, Vec<u8>) {
-    (
-        200,
-        [
-            "HTTP/1.1 200 OK",
-            "Content-Type: text/plain",
-            "Content-Length: 0",
-            "",
-            "",
-        ]
-        .join("\r\n")
-        .into_bytes(),
-    )
+fn handle_root(connection_close: bool) -> (u16, Vec<u8>) {
+    let mut headers = vec![
+        "HTTP/1.1 200 OK",
+        "Content-Type: text/plain",
+        "Content-Length: 0",
+    ];
+    if connection_close {
+        headers.push("Connection: close");
+    }
+    headers.push("");
+    headers.push("");
+    (200, headers.join("\r\n").into_bytes())
 }
 
-fn handle_echo(request: &Request) -> (u16, Vec<u8>) {
+fn handle_echo(request: &Request, connection_close: bool) -> (u16, Vec<u8>) {
 
     // Extract the text to echo from the path (everything after "/echo/")
     let text = request
@@ -282,6 +281,9 @@ fn handle_echo(request: &Request) -> (u16, Vec<u8>) {
     ];
     // Remove empty headers (e.g., if encoding_header is empty)
     header_parts.retain(|h| !h.is_empty());
+    if connection_close {
+        header_parts.push("Connection: close");
+    }
     // Push two empty strings to create the required \r\n\r\n after the headers
     header_parts.push("");
     header_parts.push("");
@@ -291,16 +293,20 @@ fn handle_echo(request: &Request) -> (u16, Vec<u8>) {
     (200, response)
 }
 
-fn handle_user_agent(request: &Request) -> (u16, Vec<u8>) {
+fn handle_user_agent(request: &Request, connection_close: bool) -> (u16, Vec<u8>) {
     let user_agent = get_header_else(request, "User-Agent", "Unknown");
-    let header = [
+    let content_length_header = format!("Content-Length: {}", user_agent.len());
+    let mut header_parts = vec![
         "HTTP/1.1 200 OK",
         "Content-Type: text/plain",
-        &format!("Content-Length: {}", user_agent.len()),
-        "",
-        "",
-    ]
-    .join("\r\n");
+        &content_length_header,
+    ];
+    if connection_close {
+        header_parts.push("Connection: close");
+    }
+    header_parts.push("");
+    header_parts.push("");
+    let header = header_parts.join("\r\n");
     let mut response = header.into_bytes();
     response.extend_from_slice(user_agent.as_bytes());
     (200, response)
@@ -313,13 +319,13 @@ fn gzip_compress(data: &[u8]) -> Vec<u8> {
 }
 
 /// Send a file
-fn handle_file_get(request: &Request, server_config: &ServerConfig) -> (u16, Vec<u8>) {
+fn handle_file_get(request: &Request, server_config: &ServerConfig, connection_close: bool) -> (u16, Vec<u8>) {
     let file_path = request.path.strip_prefix("/files/").unwrap_or("");
     let full_path = format!("{}/{}", server_config.directory.display(), file_path);
     // Send 404 if file does not exist, 500 if it exists but read failed, 200 if read succeeded
     if !std::path::Path::new(&full_path).exists() {
         eprintln!("Error: File '{}' not found", full_path);
-        return handle_404();
+        return handle_404(connection_close);
     }
     match std::fs::read(&full_path) {
         // `contents` is the read content of the file as a Vec<u8>
@@ -344,6 +350,9 @@ fn handle_file_get(request: &Request, server_config: &ServerConfig) -> (u16, Vec
             ];
             // Remove empty headers (e.g., if encoding_header is empty)
             headers.retain(|h| !h.is_empty());
+            if connection_close {
+                headers.push("Connection: close");
+            }
             // Push two empty strings to create the required \r\n\r\n after the headers
             headers.push("");
             headers.push("");
@@ -355,29 +364,31 @@ fn handle_file_get(request: &Request, server_config: &ServerConfig) -> (u16, Vec
         }
         Err(_) => {
             eprintln!("Error: Could not read file '{}'", full_path);
+            let conn_header = if connection_close { "Connection: close\r\n" } else { "" };
             (
                 500,
-                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n{}\r\n", conn_header).into_bytes(),
             )
         }
     }
 }
 
 /// Receive and save a file
-fn handle_file_post(request: &Request, server_config: &ServerConfig) -> (u16, Vec<u8>) {
+fn handle_file_post(request: &Request, server_config: &ServerConfig, connection_close: bool) -> (u16, Vec<u8>) {
     let file_path = request.path.strip_prefix("/files/").unwrap_or("");
     let full_path = format!("{}/{}", server_config.directory.display(), file_path);
+    let conn_header = if connection_close { "Connection: close\r\n" } else { "" };
     if let Some(body) = &request.body {
         match std::fs::write(&full_path, body) {
             Ok(_) => (
                 201,
-                b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                format!("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n{}\r\n", conn_header).into_bytes(),
             ),
             Err(_) => {
                 eprintln!("Error: Could not write file '{}'", full_path);
                 (
                     500,
-                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n{}\r\n", conn_header).into_bytes(),
                 )
             }
         }
@@ -386,23 +397,24 @@ fn handle_file_post(request: &Request, server_config: &ServerConfig) -> (u16, Ve
         match std::fs::File::create(&full_path) {
             Ok(_) => (
                 201,
-                b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                format!("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n{}\r\n", conn_header).into_bytes(),
             ),
             Err(_) => {
                 eprintln!("Error: Could not create file '{}'", full_path);
                 (
                     500,
-                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n{}\r\n", conn_header).into_bytes(),
                 )
             }
         }
     }
 }
 
-fn handle_404() -> (u16, Vec<u8>) {
+fn handle_404(connection_close: bool) -> (u16, Vec<u8>) {
+    let conn_header = if connection_close { "Connection: close\r\n" } else { "" };
     (
         404,
-        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        format!("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n{}\r\n", conn_header).into_bytes(),
     )
 }
 
