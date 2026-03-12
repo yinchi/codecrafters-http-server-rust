@@ -24,20 +24,26 @@ fn main() -> Result<(), IoError> {
         .cloned()
         .unwrap_or_else(|| ".".to_string());
 
-    // Sanity check: Ensure the directory exists 
-    let dir_path = std::path::Path::new(&file_directory).canonicalize().unwrap_or_else(|_| {
-        eprintln!(
-            "Error: Directory '{}' does not exist. Please create it.",
-            file_directory
-        );
-        std::process::exit(1);
-    });
+    // Sanity check: Ensure the directory exists
+    let dir_path = std::path::Path::new(&file_directory)
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "Error: Directory '{}' does not exist. Please create it.",
+                file_directory
+            );
+            std::process::exit(1);
+        });
 
     let server_config = ServerConfig {
         directory: dir_path,
     };
 
-    println!("Starting server on {} with file directory '{}'", HOST, server_config.directory.display());
+    println!(
+        "Starting server on {} with file directory '{}'",
+        HOST,
+        server_config.directory.display()
+    );
 
     let listener = TcpListener::bind(HOST).unwrap();
     let pool = threadpool::ThreadPool::new(NUM_THREADS);
@@ -82,7 +88,13 @@ fn handle_client(
 ) -> std::io::Result<()> {
     let request = Request::from_stream(stream)?;
     let (status, response) = handle_request(&request, &server_config);
-    println!("{} {} {}", request.method, request.path, status);
+    println!(
+        "{:<21} {:<3} {:<7} {}",
+        stream.peer_addr()?,
+        status,
+        request.method,
+        request.path,
+    );
     stream.write_all(response.as_bytes())?;
     Ok(())
 }
@@ -156,9 +168,19 @@ fn handle_request(request: &Request, server_config: &ServerConfig) -> (u16, Stri
     // println!("Received request: {:?}", request);
     match request.path.as_str() {
         "/" => handle_root(),
-        s if s.starts_with("/echo/") => handle_echo(request),
-        s if s.starts_with("/user-agent") => handle_user_agent(request),
-        s if s.starts_with("/files/") => handle_file(request, server_config),
+        s if s.starts_with("/echo/") => match request.method.as_str() {
+            "GET" => handle_echo(request),
+            _ => handle_404(), // Only support GET for /echo/
+        },
+        s if s.starts_with("/user-agent") => match request.method.as_str() {
+            "GET" => handle_user_agent(request),
+            _ => handle_404(), // Only support GET for /user-agent
+        },
+        s if s.starts_with("/files/") => match request.method.as_str() {
+            "GET" => handle_file_get(request, server_config),
+            "POST" => handle_file_post(request, server_config),
+            _ => handle_404(), // Unsupported method for /files/
+        },
         _ => handle_404(),
     }
 }
@@ -201,9 +223,14 @@ fn handle_user_agent(request: &Request) -> (u16, String) {
 }
 
 /// Send a file
-fn handle_file(request: &Request, server_config: &ServerConfig) -> (u16, String) {
+fn handle_file_get(request: &Request, server_config: &ServerConfig) -> (u16, String) {
     let file_path = request.path.strip_prefix("/files/").unwrap_or("");
     let full_path = format!("{}/{}", server_config.directory.display(), file_path);
+    // Send 404 if file does not exist, 500 if it exists but read failed, 200 if read succeeded
+    if !std::path::Path::new(&full_path).exists() {
+        eprintln!("Error: File '{}' not found", full_path);
+        return handle_404();
+    }
     match std::fs::read(&full_path) {
         Ok(contents) => (
             200,
@@ -218,7 +245,64 @@ fn handle_file(request: &Request, server_config: &ServerConfig) -> (u16, String)
         ),
         Err(_) => {
             eprintln!("Error: Could not read file '{}'", full_path);
-            handle_404() // file not found or error reading file, return 404
+            (
+                500,
+                [
+                    "HTTP/1.1 500 Internal Server Error",
+                    "Content-Length: 0",
+                    "",
+                    "",
+                ]
+                .join("\r\n"),
+            )
+        }
+    }
+}
+
+/// Receive and save a file
+fn handle_file_post(request: &Request, server_config: &ServerConfig) -> (u16, String) {
+    let file_path = request.path.strip_prefix("/files/").unwrap_or("");
+    let full_path = format!("{}/{}", server_config.directory.display(), file_path);
+    if let Some(body) = &request.body {
+        match std::fs::write(&full_path, body) {
+            Ok(_) => (
+                201,
+                ["HTTP/1.1 201 Created", "Content-Length: 0", "", ""].join("\r\n"),
+            ),
+            Err(_) => {
+                eprintln!("Error: Could not write file '{}'", full_path);
+                (
+                    500,
+                    [
+                        "HTTP/1.1 500 Internal Server Error",
+                        "Content-Length: 0",
+                        "",
+                        "",
+                    ]
+                    .join("\r\n"),
+                )
+            }
+        }
+    } else {
+        // Touch an empty file if no body is provided
+        match std::fs::File::create(&full_path) {
+            Ok(_) => (
+                201,
+                ["HTTP/1.1 201 Created", "Content-Length: 0", "", ""].join("\r\n"),
+            ),
+            Err(_) => {
+                eprintln!("Error: Could not create file '{}'", full_path);
+                (
+                    500,
+                    [
+                        "HTTP/1.1 500 Internal Server Error",
+                        "Content-Length: 0",
+                        "",
+                        "",
+                    ]
+                    .join("\r\n"),
+                )
+            }
         }
     }
 }
