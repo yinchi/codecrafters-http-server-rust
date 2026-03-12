@@ -1,3 +1,4 @@
+use flate2::{Compression, write::GzEncoder};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -95,7 +96,7 @@ fn handle_client(
         request.method,
         request.path,
     );
-    stream.write_all(response.as_bytes())?;
+    stream.write_all(&response)?;
     Ok(())
 }
 
@@ -122,6 +123,22 @@ impl Request {
             IoErrorKind::InvalidData,
             "Missing HTTP version",
         ))?;
+
+        // Ensure the request line is well-formed (not more than 3 parts)
+        if parts.next().is_some() {
+            return Err(IoError::new(
+                IoErrorKind::InvalidData,
+                "Invalid request line",
+            ));
+        }
+
+        // Validate the HTTP version (only support HTTP/1.1)
+        if version != "HTTP/1.1" {
+            return Err(IoError::new(
+                IoErrorKind::InvalidData,
+                "Unsupported HTTP version",
+            ));
+        }
 
         // Parse headers
         // Each header should be in the format: Key: Value
@@ -163,7 +180,7 @@ impl Request {
     }
 }
 
-fn handle_request(request: &Request, server_config: &ServerConfig) -> (u16, String) {
+fn handle_request(request: &Request, server_config: &ServerConfig) -> (u16, Vec<u8>) {
     // Return HTTP 200 on the root path, and 404 on any other path
     // println!("Received request: {:?}", request);
     match request.path.as_str() {
@@ -185,45 +202,81 @@ fn handle_request(request: &Request, server_config: &ServerConfig) -> (u16, Stri
     }
 }
 
-fn handle_root() -> (u16, String) {
-    (
-        200,
-        ["HTTP/1.1 200 OK", "Content-Length: 0", "", ""].join("\r\n"),
-    )
-}
-
-fn handle_echo(request: &Request) -> (u16, String) {
-    let path = request.path.strip_prefix("/echo/").unwrap_or("");
+fn handle_root() -> (u16, Vec<u8>) {
     (
         200,
         [
             "HTTP/1.1 200 OK",
             "Content-Type: text/plain",
-            &format!("Content-Length: {}", path.len()),
+            "Content-Length: 0",
             "",
-            path,
+            "",
         ]
-        .join("\r\n"),
+        .join("\r\n")
+        .into_bytes(),
     )
 }
 
-fn handle_user_agent(request: &Request) -> (u16, String) {
+fn handle_echo(request: &Request) -> (u16, Vec<u8>) {
+
+    // Extract the text to echo from the path (everything after "/echo/")
+    let text = request
+        .path
+        .strip_prefix("/echo/")
+        .unwrap_or("")
+        .as_bytes()
+        .to_vec();
+
+    // Check if the client accepts gzip encoding, if yes compress and set the Content-Encoding
+    // header
+    let use_gzip = accepts_encoding(request, "gzip");
+    let (body, encoding_header) = if use_gzip {
+        (gzip_compress(&text), "Content-Encoding: gzip")
+    } else {
+        (text, "")
+    };
+
+    let content_length = format!("Content-Length: {}", body.len());
+    let mut header_parts = vec![
+        "HTTP/1.1 200 OK",
+        "Content-Type: text/plain",
+        encoding_header,
+        &content_length,
+    ];
+    // Remove empty headers (e.g., if encoding_header is empty)
+    header_parts.retain(|h| !h.is_empty());
+    // Push two empty strings to create the required \r\n\r\n after the headers
+    header_parts.push("");
+    header_parts.push("");
+
+    let mut response = header_parts.join("\r\n").into_bytes();
+    response.extend_from_slice(&body);
+    (200, response)
+}
+
+fn handle_user_agent(request: &Request) -> (u16, Vec<u8>) {
     let user_agent = get_header_else(request, "User-Agent", "Unknown");
-    (
-        200,
-        [
-            "HTTP/1.1 200 OK",
-            "Content-Type: text/plain",
-            &format!("Content-Length: {}", user_agent.len()),
-            "",
-            &user_agent,
-        ]
-        .join("\r\n"),
-    )
+    let header = [
+        "HTTP/1.1 200 OK",
+        "Content-Type: text/plain",
+        &format!("Content-Length: {}", user_agent.len()),
+        "",
+        "",
+    ]
+    .join("\r\n");
+    let mut response = header.into_bytes();
+    response.extend_from_slice(user_agent.as_bytes());
+    (200, response)
+}
+
+fn gzip_compress(data: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
 }
 
 /// Send a file
-fn handle_file_get(request: &Request, server_config: &ServerConfig) -> (u16, String) {
+fn handle_file_get(request: &Request, server_config: &ServerConfig) -> (u16, Vec<u8>) {
     let file_path = request.path.strip_prefix("/files/").unwrap_or("");
     let full_path = format!("{}/{}", server_config.directory.display(), file_path);
     // Send 404 if file does not exist, 500 if it exists but read failed, 200 if read succeeded
@@ -232,54 +285,62 @@ fn handle_file_get(request: &Request, server_config: &ServerConfig) -> (u16, Str
         return handle_404();
     }
     match std::fs::read(&full_path) {
-        Ok(contents) => (
-            200,
-            [
+        // `contents` is the read content of the file as a Vec<u8>
+        Ok(contents) => {
+            let use_gzip = accepts_encoding(request, "gzip");
+
+            // If we are using Gzip compression, then compress our file contents
+            // and set the Content-Encoding header.
+            let (body, encoding_header) = if use_gzip {
+                eprintln!("Compressing '{}' with gzip", full_path);
+                (gzip_compress(&contents), "Content-Encoding: gzip")
+            } else {
+                (contents, "")
+            };
+
+            let _content_length_header = format!("Content-Length: {}", body.len());
+            let mut headers = vec![
                 "HTTP/1.1 200 OK",
                 "Content-Type: application/octet-stream",
-                &format!("Content-Length: {}", contents.len()),
-                "",
-                &String::from_utf8_lossy(&contents),
-            ]
-            .join("\r\n"),
-        ),
+                encoding_header,
+                &_content_length_header,
+            ];
+            // Remove empty headers (e.g., if encoding_header is empty)
+            headers.retain(|h| !h.is_empty());
+            // Push two empty strings to create the required \r\n\r\n after the headers
+            headers.push("");
+            headers.push("");
+
+            let header = headers.join("\r\n");
+            let mut response = header.into_bytes();
+            response.extend_from_slice(&body);
+            (200, response)
+        }
         Err(_) => {
             eprintln!("Error: Could not read file '{}'", full_path);
             (
                 500,
-                [
-                    "HTTP/1.1 500 Internal Server Error",
-                    "Content-Length: 0",
-                    "",
-                    "",
-                ]
-                .join("\r\n"),
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(),
             )
         }
     }
 }
 
 /// Receive and save a file
-fn handle_file_post(request: &Request, server_config: &ServerConfig) -> (u16, String) {
+fn handle_file_post(request: &Request, server_config: &ServerConfig) -> (u16, Vec<u8>) {
     let file_path = request.path.strip_prefix("/files/").unwrap_or("");
     let full_path = format!("{}/{}", server_config.directory.display(), file_path);
     if let Some(body) = &request.body {
         match std::fs::write(&full_path, body) {
             Ok(_) => (
                 201,
-                ["HTTP/1.1 201 Created", "Content-Length: 0", "", ""].join("\r\n"),
+                b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_vec(),
             ),
             Err(_) => {
                 eprintln!("Error: Could not write file '{}'", full_path);
                 (
                     500,
-                    [
-                        "HTTP/1.1 500 Internal Server Error",
-                        "Content-Length: 0",
-                        "",
-                        "",
-                    ]
-                    .join("\r\n"),
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(),
                 )
             }
         }
@@ -288,30 +349,31 @@ fn handle_file_post(request: &Request, server_config: &ServerConfig) -> (u16, St
         match std::fs::File::create(&full_path) {
             Ok(_) => (
                 201,
-                ["HTTP/1.1 201 Created", "Content-Length: 0", "", ""].join("\r\n"),
+                b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_vec(),
             ),
             Err(_) => {
                 eprintln!("Error: Could not create file '{}'", full_path);
                 (
                     500,
-                    [
-                        "HTTP/1.1 500 Internal Server Error",
-                        "Content-Length: 0",
-                        "",
-                        "",
-                    ]
-                    .join("\r\n"),
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(),
                 )
             }
         }
     }
 }
 
-fn handle_404() -> (u16, String) {
+fn handle_404() -> (u16, Vec<u8>) {
     (
         404,
-        ["HTTP/1.1 404 Not Found", "Content-Length: 0", "", ""].join("\r\n"),
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
     )
+}
+
+fn accepts_encoding(request: &Request, encoding: &str) -> bool {
+    request.headers.get("Accept-Encoding").is_some_and(|v| {
+        v.split(',')
+            .any(|e| e.split(';').next().is_some_and(|s| s.trim() == encoding))
+    })
 }
 
 fn get_header(request: &Request, header_name: &str) -> Option<String> {
