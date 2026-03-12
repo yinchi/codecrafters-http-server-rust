@@ -9,16 +9,46 @@ use std::vec;
 const HOST: &str = "127.0.0.1:4221";
 const NUM_THREADS: usize = 4;
 
-fn main() -> std::io::Result<()> {
+#[derive(Clone)]
+struct ServerConfig {
+    directory: std::path::PathBuf,
+}
+
+fn main() -> Result<(), IoError> {
+    // Check for --directory argument and set the file directory if provided
+    let args: Vec<String> = std::env::args().collect();
+    let file_directory = args
+        .iter()
+        .position(|arg| arg == "--directory")
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+        .unwrap_or_else(|| ".".to_string());
+
+    // Sanity check: Ensure the directory exists 
+    let dir_path = std::path::Path::new(&file_directory).canonicalize().unwrap_or_else(|_| {
+        eprintln!(
+            "Error: Directory '{}' does not exist. Please create it.",
+            file_directory
+        );
+        std::process::exit(1);
+    });
+
+    let server_config = ServerConfig {
+        directory: dir_path,
+    };
+
+    println!("Starting server on {} with file directory '{}'", HOST, server_config.directory.display());
+
     let listener = TcpListener::bind(HOST).unwrap();
     let pool = threadpool::ThreadPool::new(NUM_THREADS);
 
     for stream in listener.incoming() {
         match stream {
             Ok(mut _stream) => {
-                // Spawn a new thread to handle the request
+                // Spawn a new thread to handle the request (moves _stream into the closure)
+                let mut _config = server_config.clone();
                 pool.execute(move || {
-                    if let Err(e) = handle_client(&mut _stream) {
+                    if let Err(e) = handle_client(&mut _stream, _config) {
                         eprintln!("Error handling client: {}", e);
                     }
                 });
@@ -46,9 +76,12 @@ struct Request {
     body: Option<String>,
 }
 
-fn handle_client(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+fn handle_client(
+    stream: &mut std::net::TcpStream,
+    server_config: ServerConfig,
+) -> std::io::Result<()> {
     let request = Request::from_stream(stream)?;
-    let (status, response) = handle_request(&request);
+    let (status, response) = handle_request(&request, &server_config);
     println!("{} {} {}", request.method, request.path, status);
     stream.write_all(response.as_bytes())?;
     Ok(())
@@ -118,13 +151,14 @@ impl Request {
     }
 }
 
-fn handle_request(request: &Request) -> (u16, String) {
+fn handle_request(request: &Request, server_config: &ServerConfig) -> (u16, String) {
     // Return HTTP 200 on the root path, and 404 on any other path
     // println!("Received request: {:?}", request);
     match request.path.as_str() {
         "/" => handle_root(),
         s if s.starts_with("/echo/") => handle_echo(request),
         s if s.starts_with("/user-agent") => handle_user_agent(request),
+        s if s.starts_with("/files/") => handle_file(request, server_config),
         _ => handle_404(),
     }
 }
@@ -164,6 +198,29 @@ fn handle_user_agent(request: &Request) -> (u16, String) {
         ]
         .join("\r\n"),
     )
+}
+
+/// Send a file
+fn handle_file(request: &Request, server_config: &ServerConfig) -> (u16, String) {
+    let file_path = request.path.strip_prefix("/files/").unwrap_or("");
+    let full_path = format!("{}/{}", server_config.directory.display(), file_path);
+    match std::fs::read(&full_path) {
+        Ok(contents) => (
+            200,
+            [
+                "HTTP/1.1 200 OK",
+                "Content-Type: application/octet-stream",
+                &format!("Content-Length: {}", contents.len()),
+                "",
+                &String::from_utf8_lossy(&contents),
+            ]
+            .join("\r\n"),
+        ),
+        Err(_) => {
+            eprintln!("Error: Could not read file '{}'", full_path);
+            handle_404() // file not found or error reading file, return 404
+        }
+    }
 }
 
 fn handle_404() -> (u16, String) {
