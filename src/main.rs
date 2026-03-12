@@ -6,24 +6,25 @@ use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
 use std::vec;
 
+const HOST: &str = "127.0.0.1:4221";
+const NUM_THREADS: usize = 4;
+
 fn main() -> std::io::Result<()> {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
-
-    // TODO: Uncomment the code below to pass the first stage
-
-    let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
+    let listener = TcpListener::bind(HOST).unwrap();
+    let pool = threadpool::ThreadPool::new(NUM_THREADS);
 
     for stream in listener.incoming() {
         match stream {
             Ok(mut _stream) => {
-                let request = &Request::from_stream(&mut _stream)?;
-                let (status, response) = handle_request(request);
-                println!("{} {} {}", request.method, request.path, status);
-                _stream.write_all(response.as_bytes())?;
+                // Spawn a new thread to handle the request
+                pool.execute(move || {
+                    if let Err(e) = handle_client(&mut _stream) {
+                        eprintln!("Error handling client: {}", e);
+                    }
+                });
             }
             Err(e) => {
-                println!("error: {}", e);
+                eprintln!("Error accepting connection: {}", e);
             }
         }
     }
@@ -43,6 +44,14 @@ struct Request {
     headers: HashMap<String, String>,
     // The body of the request (if any)
     body: Option<String>,
+}
+
+fn handle_client(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+    let request = Request::from_stream(stream)?;
+    let (status, response) = handle_request(&request);
+    println!("{} {} {}", request.method, request.path, status);
+    stream.write_all(response.as_bytes())?;
+    Ok(())
 }
 
 impl Request {
